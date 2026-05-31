@@ -66,6 +66,53 @@ class MLClassificationResult:
     model_version: str
 
 
+def extract_beat_template(
+    r_peaks: np.ndarray,
+    fs: float,
+    signal: np.ndarray,
+    pre_ms: float = 90.0,
+    post_ms: float = 150.0,
+    n_points: int = 64,
+) -> np.ndarray:
+    """
+    Extract fixed-length normalized beat templates centered on each R-peak.
+    Resamples each beat window to n_points for a uniform feature vector.
+
+    Parameters
+    ----------
+    r_peaks  : R-peak sample indices
+    fs       : sampling frequency
+    signal   : ECG signal array
+    pre_ms   : ms before R-peak to include
+    post_ms  : ms after R-peak to include
+    n_points : output template length (resampled)
+
+    Returns
+    -------
+    np.ndarray, shape (n_beats, n_points)
+    """
+    from scipy.signal import resample
+
+    pre_samp = int(pre_ms * fs / 1000)
+    post_samp = int(post_ms * fs / 1000)
+    templates = np.zeros((len(r_peaks), n_points))
+
+    for i, r in enumerate(r_peaks):
+        lo = r - pre_samp
+        hi = r + post_samp
+        if lo < 0 or hi > len(signal):
+            continue
+        win = signal[lo:hi].copy()
+        # Normalize: zero-mean, unit std
+        mu, sigma = np.mean(win), np.std(win)
+        if sigma > 1e-9:
+            win = (win - mu) / sigma
+        # Resample to fixed length
+        templates[i] = resample(win, n_points)
+
+    return templates
+
+
 def extract_beat_features(
     r_peaks: np.ndarray,
     fs: float,
@@ -257,6 +304,10 @@ class MLBeatClassifier:
             if len(r_peaks) < 3:
                 continue
             features = extract_beat_features(r_peaks, fs, signal)
+            # Append beat templates if signal available
+            if signal is not None:
+                templates = extract_beat_template(r_peaks, fs, signal)
+                features = np.hstack([features, templates])
             if len(features) != len(labels):
                 min_len = min(len(features), len(labels))
                 features = features[:min_len]
@@ -309,6 +360,9 @@ class MLBeatClassifier:
             if len(r_peaks) < 3:
                 continue
             features = extract_beat_features(r_peaks, fs, signal)
+            if signal is not None:
+                templates = extract_beat_template(r_peaks, fs, signal)
+                features = np.hstack([features, templates])
             min_len = min(len(features), len(labels))
             X_all.append(features[:min_len])
             y_all.extend(labels[:min_len])
@@ -317,12 +371,12 @@ class MLBeatClassifier:
         y = np.array(y_all)
 
         y_pred = self.model.predict(X)
+        y_proba = self.model.predict_proba(X)
         acc = accuracy_score(y, y_pred)
 
         if verbose:
             print(f"\n  Test set: {len(X):,} beats across {len(test_records)} records")
             print(f"  Overall accuracy: {acc:.3f} ({acc*100:.1f}%)\n")
-            # Only report classes that appear in test set
             present = sorted(set(y) | set(y_pred))
             target_names = [CLASS_NAMES.get(c, c) for c in present]
             print(classification_report(y, y_pred, labels=present,
@@ -333,11 +387,13 @@ class MLBeatClassifier:
             'n_beats': len(X),
             'y_true': y,
             'y_pred': y_pred,
+            'y_proba': y_proba,
+            'classes': list(self.model.classes_),
         }
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def predict(self, r_peaks: np.ndarray, fs: float) -> MLClassificationResult:
+    def predict(self, r_peaks: np.ndarray, fs: float, signal: np.ndarray = None) -> MLClassificationResult:
         """
         Classify beats in a record.
 
@@ -355,7 +411,10 @@ class MLBeatClassifier:
         if not self._is_fitted:
             raise RuntimeError("Model not fitted. Run train() or load() first.")
 
-        features = extract_beat_features(r_peaks, fs)
+        features = extract_beat_features(r_peaks, fs, signal)
+        if signal is not None:
+            templates = extract_beat_template(r_peaks, fs, signal)
+            features = np.hstack([features, templates])
         probas = self.model.predict_proba(features)
         classes = self.model.classes_
 

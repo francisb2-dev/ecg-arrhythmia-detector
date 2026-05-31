@@ -158,6 +158,24 @@ def main():
     print("\n  Saving model...")
     clf.save()
 
+    # ── Evaluation report ────────────────────────────────────────────────────
+    if test_metrics and 'y_true' in test_metrics:
+        print("\n  Generating evaluation report...")
+        from src.evaluator import generate_evaluation_report
+        import webbrowser
+        eval_path = Path('reports') / 'evaluation_report.html'
+        eval_path.parent.mkdir(exist_ok=True)
+        generate_evaluation_report(
+            y_true=test_metrics['y_true'],
+            y_pred=test_metrics['y_pred'],
+            y_proba=test_metrics.get('y_proba'),
+            classes=test_metrics.get('classes', []),
+            output_path=eval_path,
+            train_metrics=train_metrics,
+        )
+        print(f"  Evaluation report → {eval_path}")
+        webbrowser.open(f"file://{eval_path.resolve()}")
+
     # ── Summary ───────────────────────────────────────────────────────────────
     print()
     print("  ══════════════════════════════════════════════════")
