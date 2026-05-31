@@ -27,6 +27,8 @@ from src.features import extract_features
 from src.classifier import classify_rhythm
 from src.visualizer import generate_all_plots
 from src.reporter import generate_report
+from src.ml_classifier import MLBeatClassifier
+from src.dashboard import generate_interactive_report
 
 
 # ── Demo records ─────────────────────────────────────────────────────────────
@@ -110,6 +112,18 @@ def analyze_record(record_info: dict) -> dict:
     primary = classification.primary_rhythm
     print(f"done — {primary.name} ({primary.confidence:.0f}%)")
 
+    # ML beat classification (if model available)
+    ml_result = None
+    if MLBeatClassifier.is_available():
+        try:
+            clf = MLBeatClassifier.load()
+            ml_result = clf.predict(detection.r_peaks, ecg.fs)
+            pvc = ml_result.pvc_burden_pct
+            abn = ml_result.abnormal_burden_pct
+            print(f"  [ML] Beat classification — PVC burden {pvc:.1f}%, abnormal {abn:.1f}%")
+        except Exception:
+            pass
+
     # Report
     print("  [7/7] Generating report...", end=" ", flush=True)
     plots = generate_all_plots(
@@ -131,7 +145,22 @@ def analyze_record(record_info: dict) -> dict:
         signal_quality=quality,
         output_path=report_path,
     )
+
+    # Interactive Plotly dashboard
+    interactive_path = generate_interactive_report(
+        record_id=record,
+        signal=filtered.filtered,
+        fs=ecg.fs,
+        r_peaks=detection.r_peaks,
+        rr_sec=detection.rr_intervals_sec,
+        features=hrv,
+        classification=classification,
+        output_dir=REPORTS_DIR,
+        ml_result=ml_result,
+        duration_sec=duration,
+    )
     print(f"done → {report_path}")
+    print(f"         interactive → {interactive_path}")
 
     return {
         "record": record,
@@ -212,16 +241,20 @@ def main():
 
     print_summary(results)
 
-    # Open all reports in browser
+    # Open interactive reports in browser (preferred) then static
+    opened = 0
     for r in results:
-        path = r["report_path"]
+        interactive = REPORTS_DIR / f"ecg_interactive_{r['record']}.html"
+        static = r["report_path"]
+        path = interactive if interactive.exists() else static
         if path.exists():
             webbrowser.open(f"file://{path.absolute()}")
-            time.sleep(0.5)  # Small delay between tabs
+            time.sleep(0.5)
+            opened += 1
 
     elapsed = time.time() - t_total
     print(f"  Total time: {elapsed:.1f}s\n")
-    print("  ✓ Demo complete! Check your browser for the HTML reports.\n")
+    print(f"  ✓ Demo complete! Opened {opened} interactive reports in your browser.\n")
 
 
 if __name__ == "__main__":
