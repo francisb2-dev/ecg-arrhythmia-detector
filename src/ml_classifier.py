@@ -117,6 +117,9 @@ def extract_beat_features(
     r_peaks: np.ndarray,
     fs: float,
     signal: np.ndarray = None,
+    global_normal_template: Optional[np.ndarray] = None,
+    global_lbbb_template: Optional[np.ndarray] = None,
+    global_rbbb_template: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Extract per-beat features for classification.
@@ -130,31 +133,40 @@ def extract_beat_features(
         5: pre-RR ratio (pre-RR / local mean)
         6: RR difference (RR - pre-RR)
 
-    Morphological features from ECG waveform (8, if signal provided):
+    Morphological features from ECG waveform (11, if signal provided):
         7:  R amplitude (normalized)
         8:  QRS width estimate (samples)
         9:  pre-R slope (mean signal derivative before peak)
         10: post-R slope
-        11: template correlation (similarity to mean beat)
+        11: Normal template correlation — correlation with global mean Normal beat.
+            Per-record mean is blind to BBB (a BBB-only record has a BBB mean
+            template); global Normal template lets the classifier measure
+            how "Normal-like" each beat is regardless of the record's rhythm.
         12: beat energy
         13: skewness of beat window
         14: kurtosis of beat window
+        15: QRS duration (ms) — clinically, BBB > 120 ms
+        16: LBBB template correlation — correlation with global mean Left BBB beat
+        17: RBBB template correlation — correlation with global mean Right BBB beat
 
     Parameters
     ----------
     r_peaks : np.ndarray — sample indices of R-peaks
     fs : float — sampling frequency
     signal : np.ndarray or None — ECG signal for morphological features
+    global_normal_template : np.ndarray or None — mean Normal beat across training
+    global_lbbb_template  : np.ndarray or None — mean Left BBB beat across training
+    global_rbbb_template  : np.ndarray or None — mean Right BBB beat across training
 
     Returns
     -------
-    np.ndarray, shape (n_beats, 7) or (n_beats, 15)
+    np.ndarray, shape (n_beats, 7) or (n_beats, 18)
     """
     from scipy.stats import skew, kurtosis as sp_kurtosis
 
     n = len(r_peaks)
     if n < 3:
-        n_feat = 7 if signal is None else 15
+        n_feat = 7 if signal is None else 18
         return np.zeros((n, n_feat))
 
     rr_samples = np.diff(r_peaks).astype(float)
@@ -184,20 +196,37 @@ def extract_beat_features(
     # ── Morphological features ─────────────────────────────────────────────
     # Window: 100ms before and after R-peak
     half_win = int(0.1 * fs)
-    morph_features = np.zeros((n, 8))
+    morph_features = np.zeros((n, 11))
 
-    # Build mean beat template for correlation
-    templates = []
-    for i, r in enumerate(r_peaks):
-        lo = r - half_win
-        hi = r + half_win
-        if lo >= 0 and hi < len(signal):
-            win = signal[lo:hi]
-            templates.append(win)
-    if templates:
-        mean_template = np.mean(templates, axis=0)
-    else:
-        mean_template = None
+    def _normalize_template(t: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if t is None:
+            return None
+        std = np.std(t)
+        return (t - np.mean(t)) / (std + 1e-9)
+
+    # Precompute normalized reference templates.
+    # Global class templates (computed from annotated beats across all training
+    # records) let the RF measure morphological similarity to known archetypes
+    # rather than the per-record mean, which is uninformative in records that
+    # consist entirely of BBB beats.
+    norm_ref = _normalize_template(global_normal_template)
+    lbbb_ref = _normalize_template(global_lbbb_template)
+    rbbb_ref = _normalize_template(global_rbbb_template)
+
+    # Fall back to per-record mean when no global Normal template is provided.
+    if norm_ref is None:
+        templates = []
+        for r in r_peaks:
+            lo, hi = r - half_win, r + half_win
+            if lo >= 0 and hi < len(signal):
+                templates.append(signal[lo:hi])
+        if templates:
+            norm_ref = _normalize_template(np.mean(templates, axis=0))
+
+    def _corr_with(win_norm: np.ndarray, ref: Optional[np.ndarray]) -> float:
+        if ref is None or len(win_norm) != len(ref):
+            return 0.0
+        return float(np.corrcoef(win_norm, ref)[0, 1])
 
     for i, r in enumerate(r_peaks):
         lo = r - half_win
@@ -207,35 +236,27 @@ def extract_beat_features(
         win = signal[lo:hi]
         r_amp = signal[r]
 
-        # Normalize window
         win_std = np.std(win)
         win_norm = (win - np.mean(win)) / (win_std + 1e-9)
 
-        # Pre/post slopes
         pre_slope = np.mean(np.diff(signal[max(0, r - half_win):r]))
         post_slope = np.mean(np.diff(signal[r:min(len(signal), r + half_win)]))
 
-        # QRS width: samples where signal > 50% of R amplitude
         threshold = 0.5 * abs(r_amp)
-        qrs_mask = np.abs(signal[lo:hi]) > threshold
-        qrs_width = float(np.sum(qrs_mask))
-
-        # Template correlation
-        if mean_template is not None and len(win) == len(mean_template):
-            mt_std = np.std(mean_template)
-            mt_norm = (mean_template - np.mean(mean_template)) / (mt_std + 1e-9)
-            corr = float(np.corrcoef(win_norm, mt_norm)[0, 1])
-        else:
-            corr = 0.0
+        qrs_width_samples = float(np.sum(np.abs(signal[lo:hi]) > threshold))
+        qrs_duration_ms = qrs_width_samples * 1000.0 / fs  # >120ms = BBB criterion
 
         morph_features[i, 0] = r_amp
-        morph_features[i, 1] = qrs_width
+        morph_features[i, 1] = qrs_width_samples
         morph_features[i, 2] = pre_slope
         morph_features[i, 3] = post_slope
-        morph_features[i, 4] = corr
-        morph_features[i, 5] = float(np.sum(win ** 2))  # energy
+        morph_features[i, 4] = _corr_with(win_norm, norm_ref)   # Normal similarity
+        morph_features[i, 5] = float(np.sum(win ** 2))          # energy
         morph_features[i, 6] = float(skew(win))
         morph_features[i, 7] = float(sp_kurtosis(win))
+        morph_features[i, 8] = qrs_duration_ms
+        morph_features[i, 9] = _corr_with(win_norm, lbbb_ref)   # LBBB similarity
+        morph_features[i, 10] = _corr_with(win_norm, rbbb_ref)  # RBBB similarity
 
     return np.hstack([rr_features, morph_features])
 
@@ -262,12 +283,15 @@ class MLBeatClassifier:
     """
 
     MODEL_FILE = MODELS_DIR / 'rf_classifier.joblib'
-    VERSION = '1.0'
+    VERSION = '1.2'  # global Normal/LBBB/RBBB templates + QRS duration feature
 
     def __init__(self):
         self.model = None
         self.classes_ = CLASSES
         self._is_fitted = False
+        self.global_normal_template: Optional[np.ndarray] = None
+        self.global_lbbb_template: Optional[np.ndarray] = None
+        self.global_rbbb_template: Optional[np.ndarray] = None
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -295,6 +319,44 @@ class MLBeatClassifier:
 
         X_all, y_all = [], []
 
+        # Build global class reference templates from annotated training beats.
+        # Per-record mean templates are blind to BBB: a BBB-only record produces
+        # a BBB mean template, making correlation useless as a discriminating
+        # feature. Global templates let the classifier compare each beat to
+        # known archetypes regardless of the record's dominant rhythm.
+        class_windows: Dict[str, list] = {'N': [], 'L': [], 'R': []}
+        for record in train_records:
+            if len(record) != 4:
+                continue
+            r_peaks, labels, fs, signal = record
+            half_win = int(0.1 * fs)
+            for r, lbl in zip(r_peaks, labels):
+                if lbl not in class_windows:
+                    continue
+                lo, hi = r - half_win, r + half_win
+                if lo < 0 or hi >= len(signal):
+                    continue
+                win = signal[lo:hi]
+                win_std = np.std(win)
+                if win_std > 1e-9:
+                    class_windows[lbl].append((win - np.mean(win)) / win_std)
+
+        def _make_template(windows: list, label: str) -> Optional[np.ndarray]:
+            if not windows:
+                return None
+            lengths = [len(w) for w in windows]
+            modal_len = max(set(lengths), key=lengths.count)
+            windows = [w for w in windows if len(w) == modal_len]
+            tmpl = np.mean(windows, axis=0)
+            if verbose:
+                print(f"  Global {label:6s} template: {len(windows):,} beats, "
+                      f"window={modal_len} samples")
+            return tmpl
+
+        self.global_normal_template = _make_template(class_windows['N'], 'Normal')
+        self.global_lbbb_template   = _make_template(class_windows['L'], 'LBBB ')
+        self.global_rbbb_template   = _make_template(class_windows['R'], 'RBBB ')
+
         for record in train_records:
             if len(record) == 4:
                 r_peaks, labels, fs, signal = record
@@ -303,7 +365,12 @@ class MLBeatClassifier:
                 signal = None
             if len(r_peaks) < 3:
                 continue
-            features = extract_beat_features(r_peaks, fs, signal)
+            features = extract_beat_features(
+                r_peaks, fs, signal,
+                global_normal_template=self.global_normal_template,
+                global_lbbb_template=self.global_lbbb_template,
+                global_rbbb_template=self.global_rbbb_template,
+            )
             # Append beat templates if signal available
             if signal is not None:
                 templates = extract_beat_template(r_peaks, fs, signal)
@@ -359,7 +426,12 @@ class MLBeatClassifier:
                 signal = None
             if len(r_peaks) < 3:
                 continue
-            features = extract_beat_features(r_peaks, fs, signal)
+            features = extract_beat_features(
+                r_peaks, fs, signal,
+                global_normal_template=self.global_normal_template,
+                global_lbbb_template=self.global_lbbb_template,
+                global_rbbb_template=self.global_rbbb_template,
+            )
             if signal is not None:
                 templates = extract_beat_template(r_peaks, fs, signal)
                 features = np.hstack([features, templates])
@@ -411,7 +483,12 @@ class MLBeatClassifier:
         if not self._is_fitted:
             raise RuntimeError("Model not fitted. Run train() or load() first.")
 
-        features = extract_beat_features(r_peaks, fs, signal)
+        features = extract_beat_features(
+            r_peaks, fs, signal,
+            global_normal_template=self.global_normal_template,
+            global_lbbb_template=self.global_lbbb_template,
+            global_rbbb_template=self.global_rbbb_template,
+        )
         if signal is not None:
             templates = extract_beat_template(r_peaks, fs, signal)
             features = np.hstack([features, templates])
@@ -459,7 +536,13 @@ class MLBeatClassifier:
         import joblib
         save_path = path or self.MODEL_FILE
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({'model': self.model, 'version': self.VERSION}, save_path)
+        joblib.dump({
+            'model': self.model,
+            'version': self.VERSION,
+            'global_normal_template': self.global_normal_template,
+            'global_lbbb_template':   self.global_lbbb_template,
+            'global_rbbb_template':   self.global_rbbb_template,
+        }, save_path)
         print(f"  Model saved → {save_path}")
 
     @classmethod
@@ -473,6 +556,9 @@ class MLBeatClassifier:
         instance = cls()
         instance.model = data['model']
         instance.VERSION = data.get('version', '1.0')
+        instance.global_normal_template = data.get('global_normal_template')
+        instance.global_lbbb_template   = data.get('global_lbbb_template')
+        instance.global_rbbb_template   = data.get('global_rbbb_template')
         instance._is_fitted = True
         return instance
 

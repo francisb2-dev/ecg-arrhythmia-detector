@@ -40,6 +40,16 @@ python demo.py
 
 The demo analyzes three records spanning different rhythm types and opens the HTML reports automatically. On a first run it downloads ~3 MB of data from PhysioNet. Subsequent runs use local cache.
 
+### Train the ML Classifier
+
+```bash
+# Train Random Forest on all 48 MIT-BIH records (downloads data if needed, ~5 min)
+python train.py
+
+# Evaluate saved model and print per-class F1
+python eval_metrics.py
+```
+
 ### Analyze Any Record
 
 ```bash
@@ -204,21 +214,28 @@ Tests use synthetic signals with known properties — not random fuzzing. Each t
 ```
 ecg-arrhythmia-detector/
 ├── src/
-│   ├── loader.py          # PhysioNet data download + loading (wfdb)
-│   ├── preprocessor.py    # Butterworth filters, notch, signal quality
-│   ├── detector.py        # Pan-Tompkins QRS detection from scratch
-│   ├── features.py        # HRV time + frequency domain metrics
-│   ├── classifier.py      # Rule-based rhythm classification
-│   ├── visualizer.py      # matplotlib clinical plots (dark theme)
-│   └── reporter.py        # Jinja2 HTML report template
-├── reports/               # Generated HTML reports
-├── data/                  # Downloaded MIT-BIH records (auto-populated)
+│   ├── loader.py           # PhysioNet data download + loading (wfdb)
+│   ├── preprocessor.py     # Butterworth filters, notch, signal quality
+│   ├── detector.py         # Pan-Tompkins QRS detection from scratch
+│   ├── features.py         # HRV time + frequency domain metrics
+│   ├── classifier.py       # Rule-based rhythm classification
+│   ├── ml_classifier.py    # Random Forest beat classifier (18-feature + raw template)
+│   ├── cnn_classifier.py   # 1D-CNN beat classifier (experimental)
+│   ├── evaluator.py        # Evaluation report generator
+│   ├── visualizer.py       # matplotlib clinical plots (dark theme)
+│   └── reporter.py         # Jinja2 HTML report template
+├── models/
+│   └── rf_classifier.joblib   # Trained RF model (v1.2)
+├── reports/                # Generated HTML reports
+├── data/                   # Downloaded MIT-BIH records (auto-populated)
 ├── tests/
 │   ├── test_preprocessor.py
 │   ├── test_detector.py
 │   └── test_classifier.py
-├── analyze.py             # CLI entry point (Click)
-├── demo.py                # One-command demo
+├── analyze.py              # CLI entry point (Click)
+├── train.py                # RF training pipeline (MIT-BIH, 48 records)
+├── eval_metrics.py         # Per-class F1 evaluation + resume bullet output
+├── demo.py                 # One-command demo
 └── requirements.txt
 ```
 
@@ -238,20 +255,48 @@ ecg-arrhythmia-detector/
 
 ---
 
-## Limitations and Future Work
+## ML Classifier Performance (Random Forest, v1.2)
 
-**Current limitations:**
-- Rule-based classifier cannot distinguish AF from other highly irregular rhythms (e.g., atrial flutter with variable block)
-- QRS duration estimate is a threshold-based heuristic, not a true boundary detection algorithm
-- P-wave analysis is not implemented — AF confirmation in clinical settings requires P-wave absence detection
-- Analysis is per-record, not streaming real-time
+Trained and evaluated on the full MIT-BIH Arrhythmia Database (48 records, record-level train/test split to prevent data leakage):
+
+| Class | Precision | Recall | F1 | Support |
+|-------|-----------|--------|-----|---------|
+| Normal | 0.84 | 0.94 | **0.89** | 43,507 |
+| PVC | 0.72 | 0.88 | **0.80** | 5,890 |
+| Atrial Ectopic | 0.36 | 0.16 | 0.22 | 2,605 |
+| Right BBB | 0.34 | 0.16 | 0.22 | 3,562 |
+| Left BBB | 0.00 | 0.00 | 0.00 | 3,460 |
+
+**Overall test accuracy: 77.1% (61,839 beats, 25 records)**
+
+### Left BBB Root Cause Analysis
+
+Left BBB F1 = 0.00 despite 4,615 annotated training beats. Root cause identified through feature analysis:
+
+The training LBBB beats come from records 109 and 111 (two patients). When we compute a global mean LBBB template from these records and measure its correlation with test LBBB beats (records 207, 214 — different patients), the mean correlation is **0.127** — compared to **0.816** for Normal beats. The LBBB morphology from records 109/111 is more similar to Normal beats than to the LBBB beats in records 207/214.
+
+This is not a feature engineering failure. It is a fundamental property of single-lead ECG BBB detection: LBBB morphology varies significantly between patients depending on the degree of block, the QRS axis, and lead placement. With only two training patients and two test patients, there is insufficient corpus diversity to learn a generalizable morphological signature.
+
+**What this means for next steps:**
+1. Multi-lead ECG (12-lead) provides better BBB discriminability — the characteristic M-shaped QRS in V5/V6 is lead-specific and more consistent across patients than MLII morphology
+2. A 1D-CNN trained on a larger corpus (e.g., PTB-XL, 21,799 records) would implicitly learn patient-invariant BBB representations
+3. A rule-based fallback for QRS duration (>120ms threshold) would help, but requires better QRS onset/offset detection than the current threshold-based estimate
+
+---
+
+## Limitations and Known Issues
+
+- **Left BBB generalization**: single-lead morphological variability between patients prevents reliable detection with the current training corpus (see above)
+- **Rule-based rhythm classifier**: cannot distinguish AF from other highly irregular rhythms (e.g., atrial flutter with variable block); P-wave analysis is not implemented
+- **QRS duration estimate**: the threshold-based QRS width heuristic underestimates absolute duration when the signal is globally normalized — a dedicated QRS onset/offset detector would improve BBB detection
+- **Single-lead analysis only**: MLII-equivalent lead provides one projection of the cardiac dipole; definitive BBB diagnosis requires a 12-lead view
 
 **Potential extensions:**
-- Machine learning classifier trained on MIT-BIH annotations (Random Forest or 1D-CNN)
+- 12-lead support for improved BBB and ischemia detection (requires multi-channel data loader)
+- 1D-CNN trained on PTB-XL or similar larger dataset for better per-class generalization
 - Real-time streaming mode via websocket or serial port (compatible with ADS1292 ECG AFE)
-- 12-lead support (currently single-lead)
-- WFDB annotation overlay for ground-truth comparison visualization
 - ST-segment elevation detection for ischemia screening
+- WFDB annotation overlay for ground-truth comparison visualization
 
 ---
 
